@@ -9,6 +9,8 @@ async function apiFetch(url) {
   return d;
 }
 
+// ── Own profile & stats ───────────────────────────────────────
+
 async function getProfile() {
   return await apiFetch(`${API}/me?fields=username,name,threads_profile_picture_url,threads_biography,followers_count&access_token=${ACCESS_TOKEN}`);
 }
@@ -81,15 +83,12 @@ async function getTopPosts(limit = 5) {
     .slice(0, limit);
 }
 
+// ── Publishing ────────────────────────────────────────────────
+
 async function createPost(text, replyToId = null) {
-  const body = {
-    text,
-    media_type: "TEXT",
-    access_token: ACCESS_TOKEN,
-  };
+  const body = { text, media_type: "TEXT", access_token: ACCESS_TOKEN };
   if (replyToId) body.reply_to_id = replyToId;
 
-  // Step 1: Create container
   const createRes = await fetch(`${API}/me/threads`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -98,7 +97,6 @@ async function createPost(text, replyToId = null) {
   const createData = await createRes.json();
   if (createData.error) throw new Error(createData.error.message + " (code " + createData.error.code + ")");
 
-  // Step 2: Publish
   await new Promise(r => setTimeout(r, 1000));
   const publishRes = await fetch(`${API}/me/threads_publish`, {
     method: "POST",
@@ -108,7 +106,6 @@ async function createPost(text, replyToId = null) {
   const publishData = await publishRes.json();
   if (publishData.error) throw new Error(publishData.error.message + " (code " + publishData.error.code + ")");
 
-  // Step 3: Get permalink
   await new Promise(r => setTimeout(r, 1500));
   try {
     const detail = await apiFetch(`${API}/${publishData.id}?fields=id,permalink&access_token=${ACCESS_TOKEN}`);
@@ -118,12 +115,85 @@ async function createPost(text, replyToId = null) {
   }
 }
 
+// ── Reading others' posts ─────────────────────────────────────
+
+// Extract post ID from a Threads URL or return as-is if already an ID
+function parsePostId(idOrUrl) {
+  if (!idOrUrl) throw new Error("post_id is required");
+  // https://www.threads.net/@username/post/ABC123def
+  const match = idOrUrl.match(/\/post\/([A-Za-z0-9_-]+)/);
+  if (match) return match[1]; // this is a shortcode, not numeric ID
+  // If it looks like a numeric ID already
+  if (/^\d+$/.test(idOrUrl)) return idOrUrl;
+  return idOrUrl;
+}
+
+async function getPost(idOrUrl) {
+  // If URL given, we need to resolve via oembed or direct lookup
+  let postId = parsePostId(idOrUrl);
+
+  // Try direct lookup first (works if it's a numeric ID)
+  if (/^\d+$/.test(postId)) {
+    return await apiFetch(`${API}/${postId}?fields=id,text,timestamp,permalink,username,likes_count,replies_count&access_token=${ACCESS_TOKEN}`);
+  }
+
+  // If shortcode/URL, use oembed to get post details
+  const encoded = encodeURIComponent(idOrUrl.startsWith("http") ? idOrUrl : `https://www.threads.net/t/${postId}`);
+  const oembed = await apiFetch(`${API}/instagram_oembed?url=${encoded}&access_token=${ACCESS_TOKEN}`).catch(() => null);
+  if (oembed) return oembed;
+
+  throw new Error("Could not resolve post. Please provide a numeric post ID or full Threads URL.");
+}
+
+async function getPostReplies(postId, limit = 20) {
+  const id = parsePostId(postId);
+  const d = await apiFetch(`${API}/${id}/replies?fields=id,text,timestamp,permalink,username&limit=${limit}&access_token=${ACCESS_TOKEN}`);
+  return d.data || [];
+}
+
+async function searchPosts(query, limit = 10) {
+  // Threads API doesn't have a public search endpoint yet, so we search within own posts
+  // and also try keyword via hashtag if query looks like one
+  const q = query.trim().toLowerCase();
+
+  // Check if it's a hashtag search
+  if (q.startsWith("#")) {
+    const tag = q.slice(1);
+    try {
+      const d = await apiFetch(`${API}/tags/${encodeURIComponent(tag)}/recent_posts?fields=id,text,timestamp,permalink,username&limit=${limit}&access_token=${ACCESS_TOKEN}`);
+      return { source: "hashtag", tag, results: d.data || [] };
+    } catch (e) {
+      return { source: "hashtag", tag, results: [], error: e.message };
+    }
+  }
+
+  // Otherwise search within own posts
+  const { posts } = await getTodayStats();
+  const allPosts = posts;
+  const filtered = allPosts.filter(p => p.text && p.text.toLowerCase().includes(q));
+  return { source: "own_posts", query, results: filtered.slice(0, limit) };
+}
+
+async function getUserPosts(username, limit = 10) {
+  // Look up user by username first
+  try {
+    const user = await apiFetch(`${API}/${username}?fields=id,username,name,threads_biography,followers_count&access_token=${ACCESS_TOKEN}`);
+    const posts = await apiFetch(`${API}/${user.id}/threads?fields=id,text,timestamp,permalink,username&limit=${limit}&access_token=${ACCESS_TOKEN}`);
+    return {
+      user: { id: user.id, username: user.username, name: user.name, followers: user.followers_count },
+      posts: posts.data || []
+    };
+  } catch (e) {
+    throw new Error(`Could not find user @${username}: ${e.message}`);
+  }
+}
+
 // ── MCP Tools ────────────────────────────────────────────────
 
 const TOOLS = [
   {
     name: "get_profile",
-    description: "Get Threads profile info: username, followers count, bio",
+    description: "Get own Threads profile info: username, followers count, bio",
     inputSchema: { type: "object", properties: {} }
   },
   {
@@ -166,14 +236,61 @@ const TOOLS = [
   },
   {
     name: "reply_to_post",
-    description: "Reply to an existing Threads post",
+    description: "Reply to any Threads post (own or someone else's) by post ID or URL",
     inputSchema: {
       type: "object",
       properties: {
-        post_id: { type: "string", description: "The ID of the post to reply to" },
+        post_id: { type: "string", description: "Numeric post ID or full Threads post URL" },
         text: { type: "string", description: "The reply text" }
       },
       required: ["post_id", "text"]
+    }
+  },
+  {
+    name: "get_post",
+    description: "Get the content and details of any Threads post by its ID or URL",
+    inputSchema: {
+      type: "object",
+      properties: {
+        post_id: { type: "string", description: "Numeric post ID or full Threads post URL (e.g. https://www.threads.net/@user/post/ABC123)" }
+      },
+      required: ["post_id"]
+    }
+  },
+  {
+    name: "get_post_replies",
+    description: "Get all replies to a specific Threads post",
+    inputSchema: {
+      type: "object",
+      properties: {
+        post_id: { type: "string", description: "Numeric post ID or full Threads URL" },
+        limit: { type: "number", description: "Max number of replies to return (default 20)" }
+      },
+      required: ["post_id"]
+    }
+  },
+  {
+    name: "get_user_posts",
+    description: "Get recent posts from any Threads user by their username",
+    inputSchema: {
+      type: "object",
+      properties: {
+        username: { type: "string", description: "Threads username without @ (e.g. zuck)" },
+        limit: { type: "number", description: "Max number of posts to return (default 10)" }
+      },
+      required: ["username"]
+    }
+  },
+  {
+    name: "search_posts",
+    description: "Search posts by keyword (searches own posts) or by hashtag (use # prefix, e.g. #ai)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Keyword or hashtag (e.g. 'marketing' or '#ai')" },
+        limit: { type: "number", description: "Max results (default 10)" }
+      },
+      required: ["query"]
     }
   }
 ];
@@ -202,6 +319,14 @@ async function handleToolCall(name, args) {
       return await createPost(args.text);
     case "reply_to_post":
       return await createPost(args.text, args.post_id);
+    case "get_post":
+      return await getPost(args.post_id);
+    case "get_post_replies":
+      return await getPostReplies(args.post_id, args.limit || 20);
+    case "get_user_posts":
+      return await getUserPosts(args.username, args.limit || 10);
+    case "search_posts":
+      return await searchPosts(args.query, args.limit || 10);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
