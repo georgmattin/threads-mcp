@@ -18,14 +18,12 @@ async function getTodayStats() {
   const since = Math.floor(new Date(today + "T00:00:00Z") / 1000);
   const until = Math.floor(Date.now() / 1000);
 
-  // Fetch views
   let views = null;
   try {
     const vd = await apiFetch(`${API}/${USER_ID}/threads_insights?metric=views&since=${since}&until=${until}&period=day&access_token=${ACCESS_TOKEN}`);
     views = vd?.data?.[0]?.values?.reduce((s, v) => s + (v.value || 0), 0) ?? null;
   } catch {}
 
-  // Fetch today's posts
   let posts = [], cursor = null;
   for (let i = 0; i < 10; i++) {
     let url = `${API}/me/threads?fields=id,text,timestamp,permalink,is_reply&limit=50&access_token=${ACCESS_TOKEN}`;
@@ -44,7 +42,6 @@ async function getTodayStats() {
     if (!cursor) break;
   }
 
-  // Fetch today's replies
   let replies = [];
   try {
     let rcursor = null;
@@ -84,7 +81,44 @@ async function getTopPosts(limit = 5) {
     .slice(0, limit);
 }
 
-// ── MCP Protocol ─────────────────────────────────────────────
+async function createPost(text, replyToId = null) {
+  const body = {
+    text,
+    media_type: "TEXT",
+    access_token: ACCESS_TOKEN,
+  };
+  if (replyToId) body.reply_to_id = replyToId;
+
+  // Step 1: Create container
+  const createRes = await fetch(`${API}/me/threads`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const createData = await createRes.json();
+  if (createData.error) throw new Error(createData.error.message + " (code " + createData.error.code + ")");
+
+  // Step 2: Publish
+  await new Promise(r => setTimeout(r, 1000));
+  const publishRes = await fetch(`${API}/me/threads_publish`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ creation_id: createData.id, access_token: ACCESS_TOKEN }),
+  });
+  const publishData = await publishRes.json();
+  if (publishData.error) throw new Error(publishData.error.message + " (code " + publishData.error.code + ")");
+
+  // Step 3: Get permalink
+  await new Promise(r => setTimeout(r, 1500));
+  try {
+    const detail = await apiFetch(`${API}/${publishData.id}?fields=id,permalink&access_token=${ACCESS_TOKEN}`);
+    return { success: true, id: publishData.id, permalink: detail.permalink };
+  } catch {
+    return { success: true, id: publishData.id };
+  }
+}
+
+// ── MCP Tools ────────────────────────────────────────────────
 
 const TOOLS = [
   {
@@ -118,6 +152,29 @@ const TOOLS = [
       type: "object",
       properties: { limit: { type: "number", description: "How many top posts to return (default 5)" } }
     }
+  },
+  {
+    name: "create_post",
+    description: "Publish a new post on Threads",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "The text content of the post" }
+      },
+      required: ["text"]
+    }
+  },
+  {
+    name: "reply_to_post",
+    description: "Reply to an existing Threads post",
+    inputSchema: {
+      type: "object",
+      properties: {
+        post_id: { type: "string", description: "The ID of the post to reply to" },
+        text: { type: "string", description: "The reply text" }
+      },
+      required: ["post_id", "text"]
+    }
   }
 ];
 
@@ -127,18 +184,12 @@ async function handleToolCall(name, args) {
       return await getProfile();
     case "get_today_stats": {
       const s = await getTodayStats();
-      return {
-        date: new Date().toISOString().slice(0, 10),
-        views: s.views,
-        posts: s.postsCount,
-        replies: s.repliesCount
-      };
+      return { date: new Date().toISOString().slice(0, 10), views: s.views, posts: s.postsCount, replies: s.repliesCount };
     }
     case "get_today_posts": {
       const s = await getTodayStats();
       return s.posts.map(p => ({
-        id: p.id,
-        text: p.text,
+        id: p.id, text: p.text,
         time: new Date(p.timestamp).toLocaleTimeString("et-EE", { hour: "2-digit", minute: "2-digit" }),
         permalink: p.permalink
       }));
@@ -147,6 +198,10 @@ async function handleToolCall(name, args) {
       return await getPostInsights(args.post_id);
     case "get_top_posts":
       return await getTopPosts(args.limit || 5);
+    case "create_post":
+      return await createPost(args.text);
+    case "reply_to_post":
+      return await createPost(args.text, args.post_id);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -155,27 +210,17 @@ async function handleToolCall(name, args) {
 // ── SSE MCP Handler ───────────────────────────────────────────
 
 export default async function handler(req, res) {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
 
   if (req.method === "OPTIONS") { res.status(200).end(); return; }
 
-  // SSE stream
   if (req.method === "GET") {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
-
-    const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
-
-    // Send server info
-    send({
-      jsonrpc: "2.0", method: "notifications/initialized",
-      params: { serverInfo: { name: "threads-mcp", version: "1.0.0" }, capabilities: { tools: {} } }
-    });
-
+    res.write(`data: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: { serverInfo: { name: "threads-mcp", version: "1.0.0" }, capabilities: { tools: {} } } })}\n\n`);
     req.on("close", () => res.end());
     return;
   }
@@ -185,42 +230,23 @@ export default async function handler(req, res) {
     for await (const chunk of req) body += chunk;
     const msg = JSON.parse(body);
 
-    // Initialize
     if (msg.method === "initialize") {
-      res.json({
-        jsonrpc: "2.0", id: msg.id,
-        result: {
-          protocolVersion: "2024-11-05",
-          serverInfo: { name: "threads-mcp", version: "1.0.0" },
-          capabilities: { tools: {} }
-        }
-      });
+      res.json({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", serverInfo: { name: "threads-mcp", version: "1.0.0" }, capabilities: { tools: {} } } });
       return;
     }
-
-    // List tools
     if (msg.method === "tools/list") {
       res.json({ jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS } });
       return;
     }
-
-    // Call tool
     if (msg.method === "tools/call") {
       try {
         const result = await handleToolCall(msg.params.name, msg.params.arguments || {});
-        res.json({
-          jsonrpc: "2.0", id: msg.id,
-          result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }
-        });
+        res.json({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] } });
       } catch (e) {
-        res.json({
-          jsonrpc: "2.0", id: msg.id,
-          error: { code: -32000, message: e.message }
-        });
+        res.json({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: e.message } });
       }
       return;
     }
-
     res.json({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
   }
 }
