@@ -117,75 +117,48 @@ async function createPost(text, replyToId = null) {
 
 // ── Reading others' posts ─────────────────────────────────────
 
-// Extract post ID from a Threads URL or return as-is if already an ID
-function parsePostId(idOrUrl) {
-  if (!idOrUrl) throw new Error("post_id is required");
-  // https://www.threads.net/@username/post/ABC123def
-  const match = idOrUrl.match(/\/post\/([A-Za-z0-9_-]+)/);
-  if (match) return match[1]; // this is a shortcode, not numeric ID
-  // If it looks like a numeric ID already
-  if (/^\d+$/.test(idOrUrl)) return idOrUrl;
-  return idOrUrl;
+async function keywordSearch(query, limit = 20, sortOrder = "top") {
+  // Official Threads keyword search endpoint
+  // sortOrder: "top" (most engaging) or "latest" (newest first)
+  const encoded = encodeURIComponent(query);
+  const url = `${API}/keyword_search?q=${encoded}&fields=id,text,timestamp,permalink,username&limit=${limit}&sort_order=${sortOrder}&access_token=${ACCESS_TOKEN}`;
+  const d = await apiFetch(url);
+  return {
+    query,
+    sort: sortOrder,
+    count: d.data?.length || 0,
+    results: d.data || []
+  };
 }
 
-async function getPost(idOrUrl) {
-  // If URL given, we need to resolve via oembed or direct lookup
-  let postId = parsePostId(idOrUrl);
-
-  // Try direct lookup first (works if it's a numeric ID)
+async function getPost(postId) {
   if (/^\d+$/.test(postId)) {
-    return await apiFetch(`${API}/${postId}?fields=id,text,timestamp,permalink,username,likes_count,replies_count&access_token=${ACCESS_TOKEN}`);
+    return await apiFetch(`${API}/${postId}?fields=id,text,timestamp,permalink,username&access_token=${ACCESS_TOKEN}`);
   }
-
-  // If shortcode/URL, use oembed to get post details
-  const encoded = encodeURIComponent(idOrUrl.startsWith("http") ? idOrUrl : `https://www.threads.net/t/${postId}`);
-  const oembed = await apiFetch(`${API}/instagram_oembed?url=${encoded}&access_token=${ACCESS_TOKEN}`).catch(() => null);
-  if (oembed) return oembed;
-
-  throw new Error("Could not resolve post. Please provide a numeric post ID or full Threads URL.");
+  // Extract from URL: https://www.threads.net/@user/post/ABC123
+  const match = postId.match(/\/post\/([A-Za-z0-9_-]+)/);
+  if (match) {
+    // Resolve shortcode via oembed
+    const encoded = encodeURIComponent(postId.startsWith("http") ? postId : `https://www.threads.net/t/${match[1]}`);
+    return await apiFetch(`${API}/oembed?url=${encoded}&access_token=${ACCESS_TOKEN}`);
+  }
+  throw new Error("Provide a numeric post ID or full Threads URL");
 }
 
 async function getPostReplies(postId, limit = 20) {
-  const id = parsePostId(postId);
+  const id = /^\d+$/.test(postId) ? postId : postId.match(/\/post\/([A-Za-z0-9_-]+)/)?.[1] || postId;
   const d = await apiFetch(`${API}/${id}/replies?fields=id,text,timestamp,permalink,username&limit=${limit}&access_token=${ACCESS_TOKEN}`);
   return d.data || [];
 }
 
-async function searchPosts(query, limit = 10) {
-  // Threads API doesn't have a public search endpoint yet, so we search within own posts
-  // and also try keyword via hashtag if query looks like one
-  const q = query.trim().toLowerCase();
-
-  // Check if it's a hashtag search
-  if (q.startsWith("#")) {
-    const tag = q.slice(1);
-    try {
-      const d = await apiFetch(`${API}/tags/${encodeURIComponent(tag)}/recent_posts?fields=id,text,timestamp,permalink,username&limit=${limit}&access_token=${ACCESS_TOKEN}`);
-      return { source: "hashtag", tag, results: d.data || [] };
-    } catch (e) {
-      return { source: "hashtag", tag, results: [], error: e.message };
-    }
-  }
-
-  // Otherwise search within own posts
-  const { posts } = await getTodayStats();
-  const allPosts = posts;
-  const filtered = allPosts.filter(p => p.text && p.text.toLowerCase().includes(q));
-  return { source: "own_posts", query, results: filtered.slice(0, limit) };
-}
-
 async function getUserPosts(username, limit = 10) {
-  // Look up user by username first
-  try {
-    const user = await apiFetch(`${API}/${username}?fields=id,username,name,threads_biography,followers_count&access_token=${ACCESS_TOKEN}`);
-    const posts = await apiFetch(`${API}/${user.id}/threads?fields=id,text,timestamp,permalink,username&limit=${limit}&access_token=${ACCESS_TOKEN}`);
-    return {
-      user: { id: user.id, username: user.username, name: user.name, followers: user.followers_count },
-      posts: posts.data || []
-    };
-  } catch (e) {
-    throw new Error(`Could not find user @${username}: ${e.message}`);
-  }
+  // Profile discovery endpoint
+  const user = await apiFetch(`${API}/${username}?fields=id,username,name,threads_biography,followers_count&access_token=${ACCESS_TOKEN}`);
+  const posts = await apiFetch(`${API}/${user.id}/threads?fields=id,text,timestamp,permalink,username&limit=${limit}&access_token=${ACCESS_TOKEN}`);
+  return {
+    user: { id: user.id, username: user.username, name: user.name, followers: user.followers_count },
+    posts: posts.data || []
+  };
 }
 
 // ── MCP Tools ────────────────────────────────────────────────
@@ -208,7 +181,7 @@ const TOOLS = [
   },
   {
     name: "get_post_insights",
-    description: "Get detailed insights for a specific post: views, likes, replies, reposts, quotes",
+    description: "Get detailed insights for a specific own post: views, likes, replies, reposts, quotes",
     inputSchema: {
       type: "object",
       properties: { post_id: { type: "string", description: "Threads post ID" } },
@@ -217,7 +190,7 @@ const TOOLS = [
   },
   {
     name: "get_top_posts",
-    description: "Get today's top performing posts sorted by views",
+    description: "Get today's own top performing posts sorted by views",
     inputSchema: {
       type: "object",
       properties: { limit: { type: "number", description: "How many top posts to return (default 5)" } }
@@ -247,50 +220,51 @@ const TOOLS = [
     }
   },
   {
-    name: "get_post",
-    description: "Get the content and details of any Threads post by its ID or URL",
+    name: "search_posts",
+    description: "Search ANY public Threads posts by keyword using the official keyword_search API. Use sort_order='top' for most engaging posts or 'latest' for newest.",
     inputSchema: {
       type: "object",
       properties: {
-        post_id: { type: "string", description: "Numeric post ID or full Threads post URL (e.g. https://www.threads.net/@user/post/ABC123)" }
+        query: { type: "string", description: "Search keyword or phrase (e.g. 'AI', 'startup', 'marketing')" },
+        limit: { type: "number", description: "Max results (default 20)" },
+        sort_order: { type: "string", description: "'top' for most engaging or 'latest' for newest (default: top)" }
+      },
+      required: ["query"]
+    }
+  },
+  {
+    name: "get_post",
+    description: "Get the content and details of any public Threads post by its ID or URL",
+    inputSchema: {
+      type: "object",
+      properties: {
+        post_id: { type: "string", description: "Numeric post ID or full Threads URL" }
       },
       required: ["post_id"]
     }
   },
   {
     name: "get_post_replies",
-    description: "Get all replies to a specific Threads post",
+    description: "Get all replies to any public Threads post",
     inputSchema: {
       type: "object",
       properties: {
         post_id: { type: "string", description: "Numeric post ID or full Threads URL" },
-        limit: { type: "number", description: "Max number of replies to return (default 20)" }
+        limit: { type: "number", description: "Max number of replies (default 20)" }
       },
       required: ["post_id"]
     }
   },
   {
     name: "get_user_posts",
-    description: "Get recent posts from any Threads user by their username",
+    description: "Get recent posts from any public Threads user by their username",
     inputSchema: {
       type: "object",
       properties: {
         username: { type: "string", description: "Threads username without @ (e.g. zuck)" },
-        limit: { type: "number", description: "Max number of posts to return (default 10)" }
+        limit: { type: "number", description: "Max number of posts (default 10)" }
       },
       required: ["username"]
-    }
-  },
-  {
-    name: "search_posts",
-    description: "Search posts by keyword (searches own posts) or by hashtag (use # prefix, e.g. #ai)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Keyword or hashtag (e.g. 'marketing' or '#ai')" },
-        limit: { type: "number", description: "Max results (default 10)" }
-      },
-      required: ["query"]
     }
   }
 ];
@@ -319,14 +293,14 @@ async function handleToolCall(name, args) {
       return await createPost(args.text);
     case "reply_to_post":
       return await createPost(args.text, args.post_id);
+    case "search_posts":
+      return await keywordSearch(args.query, args.limit || 20, args.sort_order || "top");
     case "get_post":
       return await getPost(args.post_id);
     case "get_post_replies":
       return await getPostReplies(args.post_id, args.limit || 20);
     case "get_user_posts":
       return await getUserPosts(args.username, args.limit || 10);
-    case "search_posts":
-      return await searchPosts(args.query, args.limit || 10);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
