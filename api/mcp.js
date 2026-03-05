@@ -12,7 +12,7 @@ async function apiFetch(url) {
 // ── Own profile & stats ───────────────────────────────────────
 
 async function getProfile() {
-  return await apiFetch(`${API}/me?fields=username,name,threads_profile_picture_url,threads_biography,followers_count&access_token=${ACCESS_TOKEN}`);
+  return await apiFetch(`${API}/me?fields=username,name,threads_profile_picture_url,threads_biography&access_token=${ACCESS_TOKEN}`);
 }
 
 async function getTodayStats() {
@@ -153,10 +153,10 @@ async function getPostReplies(postId, limit = 20) {
 
 async function getUserPosts(username, limit = 10) {
   // Profile discovery endpoint
-  const user = await apiFetch(`${API}/${username}?fields=id,username,name,threads_biography,followers_count&access_token=${ACCESS_TOKEN}`);
+  const user = await apiFetch(`${API}/${username}?fields=id,username,name,threads_biography&access_token=${ACCESS_TOKEN}`);
   const posts = await apiFetch(`${API}/${user.id}/threads?fields=id,text,timestamp,permalink,username&limit=${limit}&access_token=${ACCESS_TOKEN}`);
   return {
-    user: { id: user.id, username: user.username, name: user.name, followers: user.followers_count },
+    user: { id: user.id, username: user.username, name: user.name },
     posts: posts.data || []
   };
 }
@@ -219,19 +219,7 @@ const TOOLS = [
       required: ["post_id", "text"]
     }
   },
-  {
-    name: "search_posts",
-    description: "Search ANY public Threads posts by keyword using the official keyword_search API. Use sort_order='top' for most engaging posts or 'latest' for newest.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Search keyword or phrase (e.g. 'AI', 'startup', 'marketing')" },
-        limit: { type: "number", description: "Max results (default 20)" },
-        sort_order: { type: "string", description: "'top' for most engaging or 'latest' for newest (default: top)" }
-      },
-      required: ["query"]
-    }
-  },
+
   {
     name: "get_post",
     description: "Get the content and details of any public Threads post by its ID or URL",
@@ -293,8 +281,7 @@ async function handleToolCall(name, args) {
       return await createPost(args.text);
     case "reply_to_post":
       return await createPost(args.text, args.post_id);
-    case "search_posts":
-      return await keywordSearch(args.query, args.limit || 20, args.sort_order || "top");
+
     case "get_post":
       return await getPost(args.post_id);
     case "get_post_replies":

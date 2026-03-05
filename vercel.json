@@ -1,6 +1,13 @@
 {
   "version": 2,
+  "crons": [
+    {
+      "path": "/api/daily-cron",
+      "schedule": "0 6 * * *"
+    }
+  ],
   "routes": [
-    { "src": "/(.*)", "dest": "/api/mcp.js" }
+    { "src": "/mcp", "dest": "/api/mcp.js" },
+    { "src": "/api/(.*)", "dest": "/api/$1" }
   ]
 }
