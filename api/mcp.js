@@ -1,93 +1,351 @@
-const ACCESS_TOKEN = "THAAhK47kYfANBUVJUb05WMG1rUUZAJRjZAFUHpGSkx0MEN5WGhOTnlRS21KLWc0N0t3Y29EVU1RX09RWnNVTFBGUVR0TE5KcFZAKdDhoSHhHdnR0TjFnN2tHcHRwN1p3eUhHRWFXazltVU93TGJZAeFcxdENoQ1N1Skx0SF92M1V3bm9BNFIzUm9XejQ0Rk5rd2sZD";
 const USER_ID = "34671307055793656";
+const ACCESS_TOKEN = "THAAhK47kYfANBUVJUb05WMG1rUUZAJRjZAFUHpGSkx0MEN5WGhOTnlRS21KLWc0N0t3Y29EVU1RX09RWnNVTFBGUVR0TE5KcFZAKdDhoSHhHdnR0TjFnN2tHcHRwN1p3eUhHRWFXazltVU93TGJZAeFcxdENoQ1N1Skx0SF92M1V3bm9BNFIzUm9XejQ0Rk5rd2sZD";
 const API = "https://graph.threads.net/v1.0";
-
-// Paste your Apps Script Web App URL here after deploying
-const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL || "";
 
 async function apiFetch(url) {
   const r = await fetch(url);
   const d = await r.json();
-  if (d.error) throw new Error(d.error.message);
+  if (d.error) throw new Error(d.error.message + " (code " + d.error.code + ")");
   return d;
 }
 
-async function getYesterdayPosts() {
-  const yesterday = new Date();
-  yesterday.setDate(yesterday.getDate() - 1);
-  const targetDate = yesterday.toISOString().slice(0, 10);
+// ── Own profile & stats ───────────────────────────────────────
+
+async function getProfile() {
+  return await apiFetch(`${API}/me?fields=username,name,threads_profile_picture_url,threads_biography,followers_count&access_token=${ACCESS_TOKEN}`);
+}
+
+async function getTodayStats() {
+  const today = new Date().toISOString().slice(0, 10);
+  const since = Math.floor(new Date(today + "T00:00:00Z") / 1000);
+  const until = Math.floor(Date.now() / 1000);
+
+  let views = null;
+  try {
+    const vd = await apiFetch(`${API}/${USER_ID}/threads_insights?metric=views&since=${since}&until=${until}&period=day&access_token=${ACCESS_TOKEN}`);
+    views = vd?.data?.[0]?.values?.reduce((s, v) => s + (v.value || 0), 0) ?? null;
+  } catch {}
 
   let posts = [], cursor = null;
-  for (let i = 0; i < 15; i++) {
-    let url = `${API}/me/threads?fields=id,text,timestamp,permalink&limit=100&access_token=${ACCESS_TOKEN}`;
+  for (let i = 0; i < 10; i++) {
+    let url = `${API}/me/threads?fields=id,text,timestamp,permalink,is_reply&limit=50&access_token=${ACCESS_TOKEN}`;
     if (cursor) url += `&after=${cursor}`;
     const d = await apiFetch(url);
     if (!d.data?.length) break;
-    let hitOlder = false;
+    let hitOld = false;
     for (const p of d.data) {
       if (!p.timestamp) continue;
       const day = new Date(p.timestamp).toISOString().slice(0, 10);
-      if (day === targetDate && p.text) posts.push(p);
-      else if (day < targetDate) hitOlder = true;
+      if (day === today) posts.push(p);
+      else if (day < today) hitOld = true;
     }
-    if (hitOlder) break;
+    if (hitOld) break;
     cursor = d.paging?.cursors?.after;
     if (!cursor) break;
   }
-  return { posts, date: targetDate };
+
+  let replies = [];
+  try {
+    let rcursor = null;
+    for (let i = 0; i < 10; i++) {
+      let url = `${API}/me/replies?fields=id,text,timestamp,permalink,is_reply,replied_to&limit=50&access_token=${ACCESS_TOKEN}`;
+      if (rcursor) url += `&after=${rcursor}`;
+      const d = await apiFetch(url);
+      if (!d.data?.length) break;
+      let hitOld = false;
+      for (const p of d.data) {
+        if (!p.timestamp) continue;
+        const day = new Date(p.timestamp).toISOString().slice(0, 10);
+        if (day === today && !p.replied_to) replies.push(p);
+        else if (day < today) hitOld = true;
+      }
+      if (hitOld) break;
+      rcursor = d.paging?.cursors?.after;
+      if (!rcursor) break;
+    }
+  } catch {}
+
+  return { views, postsCount: posts.length, repliesCount: replies.length, posts, replies };
 }
 
-async function getInsights(postId) {
-  try {
-    const d = await apiFetch(`${API}/${postId}/insights?metric=views,likes,replies,reposts,quotes&access_token=${ACCESS_TOKEN}`);
-    const r = {};
-    d.data?.forEach(m => { r[m.name] = m.values?.[0]?.value ?? m.total_value?.value ?? 0; });
-    return r;
-  } catch { return { views: 0, likes: 0, replies: 0, reposts: 0, quotes: 0 }; }
+async function getPostInsights(postId) {
+  const d = await apiFetch(`${API}/${postId}/insights?metric=likes,replies,reposts,quotes,views&access_token=${ACCESS_TOKEN}`);
+  const r = {};
+  d.data?.forEach(m => { r[m.name] = m.values?.[0]?.value ?? m.total_value?.value ?? 0; });
+  return r;
 }
+
+async function getTopPosts(limit = 5) {
+  const { posts } = await getTodayStats();
+  const insights = await Promise.all(posts.map(p => getPostInsights(p.id).catch(() => null)));
+  return posts.map((p, i) => ({ ...p, insights: insights[i] }))
+    .sort((a, b) => (b.insights?.views || 0) - (a.insights?.views || 0))
+    .slice(0, limit);
+}
+
+// ── Publishing ────────────────────────────────────────────────
+
+async function createPost(text, replyToId = null) {
+  const body = { text, media_type: "TEXT", access_token: ACCESS_TOKEN };
+  if (replyToId) body.reply_to_id = replyToId;
+
+  const createRes = await fetch(`${API}/me/threads`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const createData = await createRes.json();
+  if (createData.error) throw new Error(createData.error.message + " (code " + createData.error.code + ")");
+
+  await new Promise(r => setTimeout(r, 1000));
+  const publishRes = await fetch(`${API}/me/threads_publish`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ creation_id: createData.id, access_token: ACCESS_TOKEN }),
+  });
+  const publishData = await publishRes.json();
+  if (publishData.error) throw new Error(publishData.error.message + " (code " + publishData.error.code + ")");
+
+  await new Promise(r => setTimeout(r, 1500));
+  try {
+    const detail = await apiFetch(`${API}/${publishData.id}?fields=id,permalink&access_token=${ACCESS_TOKEN}`);
+    return { success: true, id: publishData.id, permalink: detail.permalink };
+  } catch {
+    return { success: true, id: publishData.id };
+  }
+}
+
+// ── Reading others' posts ─────────────────────────────────────
+
+async function keywordSearch(query, limit = 20, sortOrder = "top") {
+  // Official Threads keyword search endpoint
+  // sortOrder: "top" (most engaging) or "latest" (newest first)
+  const encoded = encodeURIComponent(query);
+  const url = `${API}/keyword_search?q=${encoded}&fields=id,text,timestamp,permalink,username&limit=${limit}&sort_order=${sortOrder}&access_token=${ACCESS_TOKEN}`;
+  const d = await apiFetch(url);
+  return {
+    query,
+    sort: sortOrder,
+    count: d.data?.length || 0,
+    results: d.data || []
+  };
+}
+
+async function getPost(postId) {
+  if (/^\d+$/.test(postId)) {
+    return await apiFetch(`${API}/${postId}?fields=id,text,timestamp,permalink,username&access_token=${ACCESS_TOKEN}`);
+  }
+  // Extract from URL: https://www.threads.net/@user/post/ABC123
+  const match = postId.match(/\/post\/([A-Za-z0-9_-]+)/);
+  if (match) {
+    // Resolve shortcode via oembed
+    const encoded = encodeURIComponent(postId.startsWith("http") ? postId : `https://www.threads.net/t/${match[1]}`);
+    return await apiFetch(`${API}/oembed?url=${encoded}&access_token=${ACCESS_TOKEN}`);
+  }
+  throw new Error("Provide a numeric post ID or full Threads URL");
+}
+
+async function getPostReplies(postId, limit = 20) {
+  const id = /^\d+$/.test(postId) ? postId : postId.match(/\/post\/([A-Za-z0-9_-]+)/)?.[1] || postId;
+  const d = await apiFetch(`${API}/${id}/replies?fields=id,text,timestamp,permalink,username&limit=${limit}&access_token=${ACCESS_TOKEN}`);
+  return d.data || [];
+}
+
+async function getUserPosts(username, limit = 10) {
+  // Profile discovery endpoint
+  const user = await apiFetch(`${API}/${username}?fields=id,username,name,threads_biography,followers_count&access_token=${ACCESS_TOKEN}`);
+  const posts = await apiFetch(`${API}/${user.id}/threads?fields=id,text,timestamp,permalink,username&limit=${limit}&access_token=${ACCESS_TOKEN}`);
+  return {
+    user: { id: user.id, username: user.username, name: user.name, followers: user.followers_count },
+    posts: posts.data || []
+  };
+}
+
+// ── MCP Tools ────────────────────────────────────────────────
+
+const TOOLS = [
+  {
+    name: "get_profile",
+    description: "Get own Threads profile info: username, followers count, bio",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "get_today_stats",
+    description: "Get today's Threads stats: total views, number of posts and replies",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "get_today_posts",
+    description: "Get list of today's posts with text and timestamps",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "get_post_insights",
+    description: "Get detailed insights for a specific own post: views, likes, replies, reposts, quotes",
+    inputSchema: {
+      type: "object",
+      properties: { post_id: { type: "string", description: "Threads post ID" } },
+      required: ["post_id"]
+    }
+  },
+  {
+    name: "get_top_posts",
+    description: "Get today's own top performing posts sorted by views",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "number", description: "How many top posts to return (default 5)" } }
+    }
+  },
+  {
+    name: "create_post",
+    description: "Publish a new post on Threads",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "The text content of the post" }
+      },
+      required: ["text"]
+    }
+  },
+  {
+    name: "reply_to_post",
+    description: "Reply to any Threads post (own or someone else's) by post ID or URL",
+    inputSchema: {
+      type: "object",
+      properties: {
+        post_id: { type: "string", description: "Numeric post ID or full Threads post URL" },
+        text: { type: "string", description: "The reply text" }
+      },
+      required: ["post_id", "text"]
+    }
+  },
+  {
+    name: "search_posts",
+    description: "Search ANY public Threads posts by keyword using the official keyword_search API. Use sort_order='top' for most engaging posts or 'latest' for newest.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search keyword or phrase (e.g. 'AI', 'startup', 'marketing')" },
+        limit: { type: "number", description: "Max results (default 20)" },
+        sort_order: { type: "string", description: "'top' for most engaging or 'latest' for newest (default: top)" }
+      },
+      required: ["query"]
+    }
+  },
+  {
+    name: "get_post",
+    description: "Get the content and details of any public Threads post by its ID or URL",
+    inputSchema: {
+      type: "object",
+      properties: {
+        post_id: { type: "string", description: "Numeric post ID or full Threads URL" }
+      },
+      required: ["post_id"]
+    }
+  },
+  {
+    name: "get_post_replies",
+    description: "Get all replies to any public Threads post",
+    inputSchema: {
+      type: "object",
+      properties: {
+        post_id: { type: "string", description: "Numeric post ID or full Threads URL" },
+        limit: { type: "number", description: "Max number of replies (default 20)" }
+      },
+      required: ["post_id"]
+    }
+  },
+  {
+    name: "get_user_posts",
+    description: "Get recent posts from any public Threads user by their username",
+    inputSchema: {
+      type: "object",
+      properties: {
+        username: { type: "string", description: "Threads username without @ (e.g. zuck)" },
+        limit: { type: "number", description: "Max number of posts (default 10)" }
+      },
+      required: ["username"]
+    }
+  }
+];
+
+async function handleToolCall(name, args) {
+  switch (name) {
+    case "get_profile":
+      return await getProfile();
+    case "get_today_stats": {
+      const s = await getTodayStats();
+      return { date: new Date().toISOString().slice(0, 10), views: s.views, posts: s.postsCount, replies: s.repliesCount };
+    }
+    case "get_today_posts": {
+      const s = await getTodayStats();
+      return s.posts.map(p => ({
+        id: p.id, text: p.text,
+        time: new Date(p.timestamp).toLocaleTimeString("et-EE", { hour: "2-digit", minute: "2-digit" }),
+        permalink: p.permalink
+      }));
+    }
+    case "get_post_insights":
+      return await getPostInsights(args.post_id);
+    case "get_top_posts":
+      return await getTopPosts(args.limit || 5);
+    case "create_post":
+      return await createPost(args.text);
+    case "reply_to_post":
+      return await createPost(args.text, args.post_id);
+    case "search_posts":
+      return await keywordSearch(args.query, args.limit || 20, args.sort_order || "top");
+    case "get_post":
+      return await getPost(args.post_id);
+    case "get_post_replies":
+      return await getPostReplies(args.post_id, args.limit || 20);
+    case "get_user_posts":
+      return await getUserPosts(args.username, args.limit || 10);
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
+// ── SSE MCP Handler ───────────────────────────────────────────
 
 export default async function handler(req, res) {
-  // Allow manual trigger via GET too (for testing)
-  if (req.method !== "GET" && req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
+
+  if (req.method === "OPTIONS") { res.status(200).end(); return; }
+
+  if (req.method === "GET") {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.write(`data: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: { serverInfo: { name: "threads-mcp", version: "1.0.0" }, capabilities: { tools: {} } } })}\n\n`);
+    req.on("close", () => res.end());
+    return;
   }
 
-  try {
-    const { posts, date } = await getYesterdayPosts();
+  if (req.method === "POST") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const msg = JSON.parse(body);
 
-    if (!posts.length) {
-      return res.json({ success: true, message: `No posts found for ${date}` });
+    if (msg.method === "initialize") {
+      res.json({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", serverInfo: { name: "threads-mcp", version: "1.0.0" }, capabilities: { tools: {} } } });
+      return;
     }
-
-    // Fetch insights for all posts (throttled)
-    const withInsights = [];
-    for (const post of posts) {
-      const ins = await getInsights(post.id);
-      withInsights.push({ ...post, ...ins });
-      await new Promise(r => setTimeout(r, 150));
+    if (msg.method === "tools/list") {
+      res.json({ jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS } });
+      return;
     }
-
-    // Score = views + (likes * 3) + (replies * 5) + (reposts * 4) + (quotes * 2)
-    const scored = withInsights
-      .map(p => ({
-        ...p,
-        score: (p.views || 0) + (p.likes || 0) * 3 + (p.replies || 0) * 5 + (p.reposts || 0) * 4 + (p.quotes || 0) * 2
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 10);
-
-    // Send to Apps Script
-    if (APPS_SCRIPT_URL) {
-      await fetch(APPS_SCRIPT_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date, posts: scored }),
-      });
+    if (msg.method === "tools/call") {
+      try {
+        const result = await handleToolCall(msg.params.name, msg.params.arguments || {});
+        res.json({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] } });
+      } catch (e) {
+        res.json({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: e.message } });
+      }
+      return;
     }
-
-    res.json({ success: true, date, postsProcessed: posts.length, topPosts: scored.length, data: scored });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+    res.json({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
   }
 }
